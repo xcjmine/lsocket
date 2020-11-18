@@ -2,20 +2,41 @@
  *
  * provide simple and easy socket support for lua
  *
- * Gunnar Zötl <gz@tset.de>, 2013
- * Released under MIT/X11 license. See file LICENSE for details.
+ * Gunnar Zötl <gz@tset.de>, 2013-2015
+ * Released under the terms of the MIT license. See file LICENSE for details.
  */
-
+#define LUA_LIB
 #include <stdlib.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <string.h>
+#if _WINDOWS && _MSC_VER > 0
+#include <io.h>
 
-#ifdef _WIN32
-
-#include "win_compat.h"
+#define strncasecmp _strnicmp
+#define strcasecmp _stricmp
 
 #else
+#include <unistd.h>
+#endif // _WINDOWS && _MSC_VER > 0
+
+#include <stdio.h>
+#include <fcntl.h>
+
+#include <string.h>
+#include "lua.h"
+#include "lauxlib.h"
+
+#if (defined _WIN32 ) || (defined _WIN64)
+#include "win_compat.h"
+
+// winsock do not need check select fd
+static void
+check_select_fd(lua_State *L, int fd, int index) {
+	if (index >= FD_SETSIZE) {
+		luaL_error(L, "bad argument to 'select' (socket file descriptor too many)");
+	}
+}
+
+#else
+#define SOCKET int
 
 #include <errno.h>
 #include <signal.h>
@@ -33,6 +54,13 @@
 
 #define init_socketlib(L)
 
+static void
+check_select_fd(lua_State *L, int fd, int index) {
+	if (fd >= FD_SETSIZE) {
+		luaL_error(L, "bad argument to 'select' (socket file descriptor too big)");
+	}
+}
+
 #endif
 
 #ifndef IPV6_ADD_MEMBERSHIP
@@ -49,14 +77,10 @@
 	#define HAVE_ABSTRACT_UDSOCKETS
 #endif
 
-#include "lua.h"
-#include "lauxlib.h"
-
-#define LSOCKET_VERSION "1.3"
+#define LSOCKET_VERSION "1.4.1"
 
 #define LSOCKET "socket"
 #define TOSTRING_BUFSIZ 64
-#define READER_BUFSIZ 4096
 #define SOCKADDR_BUFSIZ (sizeof(struct sockaddr_un) + UNIX_PATH_MAX + 1)
 #define LSOCKET_EMPTY "lsocket_empty_table"
 /* address families */
@@ -75,6 +99,14 @@
 #if LUA_VERSION_NUM == 501
 #define luaL_newlib(L,funcs) lua_newtable(L); luaL_register(L, NULL, funcs)
 #define luaL_setfuncs(L,funcs,x) luaL_register(L, NULL, funcs)
+
+static void myL_pushresultsize(luaL_Buffer *lbp, size_t sz)
+{
+	luaL_addsize(lbp, sz);
+	luaL_pushresult(lbp);
+}
+
+#define luaL_pushresultsize(lbp, sz) myL_pushresultsize(lbp, sz)
 #endif
 
 /*** Userdata handling ***/
@@ -141,6 +173,7 @@ static int lsocket_islSocket(lua_State *L, int index)
 static lSocket* lsocket_pushlSocket(lua_State *L)
 {
 	lSocket *sock = (lSocket*) lua_newuserdata(L, sizeof(lSocket));
+	sock->sockfd = -1;
 	luaL_getmetatable(L, LSOCKET);
 	lua_setmetatable(L, -2);
 	return sock;
@@ -186,11 +219,7 @@ static int lsocket_sock__gc(lua_State *L)
 static int lsocket_sock__toString(lua_State *L)
 {
 	lSocket *sock = lsocket_checklSocket(L, 1);
-	char buf[TOSTRING_BUFSIZ];
-	if (snprintf(buf, TOSTRING_BUFSIZ, "%s: %p", LSOCKET, sock) >= TOSTRING_BUFSIZ)
-		return luaL_error(L, "Whoopsie... the string representation seems to be too long.");
-		/* this should not happen, just to be sure! */
-	lua_pushstring(L, buf);
+	lua_pushfstring(L, "%s: %p", LSOCKET, sock);
 	return 1;
 }
 
@@ -581,9 +610,15 @@ static int lsocket_connect(lua_State *L)
 		if (ok < 0)
 			return lsocket_error(L, strerror(errno));
 	}
-	
-	if (connect(sock->sockfd, sa, slen) < 0 && errno != EINPROGRESS)
-		return lsocket_error(L, strerror(errno));
+	if (connect(sock->sockfd, sa, slen) < 0) {
+#if defined(WIN32)
+		if (errno != EAGAIN && errno != EWOULDBLOCK) {
+#else
+		if (errno != EINPROGRESS) {
+#endif
+			return lsocket_error(L, strerror(errno));
+		}
+	}
 
 	return 1;
 }
@@ -867,7 +902,7 @@ static int lsocket_sock_accept(lua_State *L)
  * Lua Stack:
  * 	1	the lSocket userdata
  * 	2	(optional) the length of the buffer to use for reading, defaults
- * 		to some internal value
+ * 		to LUAL_BUFFERSIZE
  * 
  * Lua Returns:
  * 	+1	a string containing the data read
@@ -879,23 +914,42 @@ static int lsocket_sock_recv(lua_State *L)
 {
 	lSocket *sock = lsocket_checklSocket(L, 1);
 
-	uint32_t howmuch = luaL_optnumber(L, 2, READER_BUFSIZ);
-	if (lua_tonumber(L, 2) > UINT_MAX)
+	uint32_t howmuch = luaL_optnumber(L, 2, LUAL_BUFFERSIZE);
+	if (lua_tointeger(L, 2) > UINT_MAX)
 		return luaL_error(L, "bad argument #1 to 'recv' (invalid number)");
 	
-	char *buf = malloc(howmuch);
+	luaL_Buffer lbuf;
+	char *buf = 0;
+
+#if LUA_VERSION_NUM == 501
+	if (howmuch <= LUAL_BUFFERSIZE) {
+		luaL_buffinit(L, &lbuf);
+		buf = luaL_prepbuffer(&lbuf);
+	} else {
+		// allocate buffer as userdata, will then be collected later
+		buf = lua_newuserdata(L, howmuch);
+	}
+#else
+	luaL_buffinit(L, &lbuf);
+	buf = luaL_prepbuffsize(&lbuf, howmuch);
+#endif
+
 	int nrd = recv(sock->sockfd, buf, howmuch, 0);
 	if (nrd < 0) {
-		free(buf);
 		if (errno == EAGAIN || errno == EWOULDBLOCK)
 			lua_pushboolean(L, 0);
 		else
 			return lsocket_error(L, strerror(errno));
-	} else if (nrd == 0)
+	} else if (nrd == 0) {
 		lua_pushnil(L);
-	else {
-		lua_pushlstring(L, buf, nrd);
-		free(buf);
+	} else {
+
+#if LUA_VERSION_NUM == 501
+		if (howmuch > LUAL_BUFFERSIZE)
+			lua_pushlstring(L, buf, nrd); 
+		else
+#endif
+		luaL_pushresultsize(&lbuf, nrd);
 	}
 	return 1;
 }
@@ -910,7 +964,7 @@ static int lsocket_sock_recv(lua_State *L)
  * Lua Stack:
  * 	1	the lSocket userdata
  * 	2	(optional) the length of the buffer to use for reading, defaults
- * 		to some internal value
+ * 		to LUAL_BUFFERSIZE
  * 
  * Lua Returns:
  * 	+1	a string containing the data read
@@ -923,26 +977,47 @@ static int lsocket_sock_recv(lua_State *L)
 static int lsocket_sock_recvfrom(lua_State *L)
 {
 	lSocket *sock = lsocket_checklSocket(L, 1);
-	uint32_t howmuch = luaL_optnumber(L, 2, READER_BUFSIZ);
-	if (lua_tonumber(L, 2) > UINT_MAX)
+	uint32_t howmuch = luaL_optnumber(L, 2, LUAL_BUFFERSIZE);
+	if (lua_tointeger(L, 2) > UINT_MAX)
 		return luaL_error(L, "bad argument #1 to 'recvfrom' (invalid number)");
 	
 	char sabuf[SOCKADDR_BUFSIZ];
 	struct sockaddr *sa = (struct sockaddr*) sabuf;
 	socklen_t slen = sizeof(sabuf);
-	char *buf = malloc(howmuch);
+
+	luaL_Buffer lbuf;
+	char *buf = 0;
+
+#if LUA_VERSION_NUM == 501
+	if (howmuch <= LUAL_BUFFERSIZE) {
+		luaL_buffinit(L, &lbuf);
+		buf = luaL_prepbuffer(&lbuf);
+	} else {
+		// allocate buffer as userdata, will then be collected later
+		buf = lua_newuserdata(L, howmuch);
+	}
+#else
+	luaL_buffinit(L, &lbuf);
+	buf = luaL_prepbuffsize(&lbuf, howmuch);
+#endif
+
 	int nrd = recvfrom(sock->sockfd, buf, howmuch, 0, sa, &slen);
 	if (nrd < 0) {
-		free(buf);
 		if (errno == EAGAIN || errno == EWOULDBLOCK)
 			lua_pushboolean(L, 0);
 		else
 			return lsocket_error(L, strerror(errno));
-	} else if (nrd == 0)
+	} else if (nrd == 0) {
 		lua_pushnil(L); /* not possible for udp, so should not get here */
-	else {
-		lua_pushlstring(L, buf, nrd);
-		free(buf);
+	} else {
+
+#if LUA_VERSION_NUM == 501
+		if (howmuch > LUAL_BUFFERSIZE)
+			lua_pushlstring(L, buf, nrd); 
+		else
+#endif
+		luaL_pushresultsize(&lbuf, nrd);
+
 		char ipbuf[SOCKADDR_BUFSIZ];
 		const char *s = _addr2string(sa, slen, ipbuf, SOCKADDR_BUFSIZ);
 		if (s)
@@ -1136,8 +1211,8 @@ static int _table2fd_set(lua_State *L, int idx, fd_set *s)
 	lua_rawgeti(L, idx, i++);
 	while (lsocket_islSocket(L, -1)) {
 		lSocket *sock = lsocket_checklSocket(L, -1);
+		check_select_fd(L, sock->sockfd, i-1);
 		if (sock->sockfd >= 0) {
-			// todo: check FD_SETSIZE
 			FD_SET(sock->sockfd, s);
 			if (sock->sockfd > maxfd) maxfd = sock->sockfd;
 		}
@@ -1371,7 +1446,7 @@ static int lsocket_resolve(lua_State *L)
  */
 static int lsocket_getinterfaces(lua_State *L)
 {
-#ifdef _WIN32
+#if (defined _WIN32 ) || (defined _WIN64)
 	// todo use GetAdaptersAddresses instead
 	return luaL_error(L, "Not implement");
 #else
@@ -1442,7 +1517,8 @@ static int lsocket_ignore(lua_State *L)
  * 
  * open and initialize this library
  */
-int luaopen_lsocket(lua_State *L)
+LUAMOD_API int 
+luaopen_lsocket(lua_State *L)
 {
 	init_socketlib(L);
 	luaL_newlib(L, lsocket);
